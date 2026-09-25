@@ -1,0 +1,11 @@
+flask
+flask-cors
+mysql-connector-python
+numpy
+scikit-learn
+shap
+openpyxl
+xgboost
+lightgbm
+statsmodels
+joblib
