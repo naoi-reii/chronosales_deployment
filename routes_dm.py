@@ -859,9 +859,27 @@ def dm_transaction_bulk_delete():
 
 @dm_bp.route("/api/dm/transactions/delete-all", methods=["DELETE"])
 def dm_transaction_delete_all():
-    """Delete ALL transactions (irreversible). Returns count of deleted rows."""
+    """Delete ALL transactions and their child payment records (irreversible)."""
     try:
-        _, affected = dm_exec("DELETE FROM transactions")
+        conn = get_db()
+        cur  = conn.cursor()
+        # Delete child payment tables first to satisfy FK constraints
+        child_tables = [
+            "payment_cash",
+            "payment_card",
+            "payment_check",
+            "payment_qr",
+            "payment_bank_transfer",
+            "payment_customer_deposit",
+            "payment_multi_splits",
+        ]
+        for tbl in child_tables:
+            cur.execute(f"DELETE FROM {tbl}")
+        cur.execute("DELETE FROM transactions")
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
         return jsonify({"deleted": affected})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
