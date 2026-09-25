@@ -1620,7 +1620,8 @@ def dm_dataset_preview():
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+        _, ext = os.path.splitext(fname)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             f.save(tmp.name)
             tmp_path = tmp.name
 
@@ -1728,7 +1729,8 @@ def dm_dataset_import():
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+        _, ext = os.path.splitext(fname)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             f.save(tmp.name)
             tmp_path = tmp.name
 
