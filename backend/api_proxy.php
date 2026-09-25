@@ -42,18 +42,21 @@ $ALLOWED = [
     'dm/transactions/export'      => ['path' => '/api/dm/transactions/export',      'csv' => true,  'methods' => ['GET']],
     'dm/transactions/import'      => ['path' => '/api/dm/transactions/import',      'csv' => false, 'methods' => ['POST']],
     'dm/transactions/bulk-delete' => ['path' => '/api/dm/transactions/bulk-delete', 'csv' => false, 'methods' => ['POST']],
+    'dm/transactions/delete-all'  => ['path' => '/api/dm/transactions/delete-all',  'csv' => false, 'methods' => ['DELETE']],
 
     // Data Management — Customers
     'dm/customers'             => ['path' => '/api/dm/customers',             'csv' => false, 'methods' => ['GET','POST']],
     'dm/customers/export'      => ['path' => '/api/dm/customers/export',      'csv' => true,  'methods' => ['GET']],
     'dm/customers/import'      => ['path' => '/api/dm/customers/import',      'csv' => false, 'methods' => ['POST']],
     'dm/customers/bulk-delete' => ['path' => '/api/dm/customers/bulk-delete', 'csv' => false, 'methods' => ['POST']],
+    'dm/customers/delete-all'  => ['path' => '/api/dm/customers/delete-all',  'csv' => false, 'methods' => ['DELETE']],
 
     // Data Management — Branches
     'dm/branches'             => ['path' => '/api/dm/branches',             'csv' => false, 'methods' => ['GET','POST']],
     'dm/branches/export'      => ['path' => '/api/dm/branches/export',      'csv' => true,  'methods' => ['GET']],
     'dm/branches/import'      => ['path' => '/api/dm/branches/import',      'csv' => false, 'methods' => ['POST']],
     'dm/branches/bulk-delete' => ['path' => '/api/dm/branches/bulk-delete', 'csv' => false, 'methods' => ['POST']],
+    'dm/branches/delete-all'  => ['path' => '/api/dm/branches/delete-all',  'csv' => false, 'methods' => ['DELETE']],
 
    // Dataset CSV Upload (transactions normalisation)
     'dm/dataset/preview' => ['path' => '/api/dm/dataset/preview', 'csv' => false, 'methods' => ['POST']],

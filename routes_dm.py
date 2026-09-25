@@ -857,6 +857,16 @@ def dm_transaction_bulk_delete():
     return jsonify({"deleted": affected})
 
 
+@dm_bp.route("/api/dm/transactions/delete-all", methods=["DELETE"])
+def dm_transaction_delete_all():
+    """Delete ALL transactions (irreversible). Returns count of deleted rows."""
+    try:
+        _, affected = dm_exec("DELETE FROM transactions")
+        return jsonify({"deleted": affected})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @dm_bp.route("/api/dm/transactions/export")
 def dm_transaction_export():
     search    = request.args.get('search',    '').strip()
@@ -1045,6 +1055,16 @@ def dm_customer_bulk_delete():
     return jsonify({"deleted": affected})
 
 
+@dm_bp.route("/api/dm/customers/delete-all", methods=["DELETE"])
+def dm_customer_delete_all():
+    """Delete ALL customers (irreversible). Returns count of deleted rows."""
+    try:
+        _, affected = dm_exec("DELETE FROM customers")
+        return jsonify({"deleted": affected})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @dm_bp.route("/api/dm/customers/export")
 def dm_customer_export():
     search = request.args.get('search', '').strip()
@@ -1191,6 +1211,16 @@ def dm_branch_bulk_delete():
         return jsonify({"deleted": affected})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@dm_bp.route("/api/dm/branches/delete-all", methods=["DELETE"])
+def dm_branch_delete_all():
+    """Delete ALL branches (irreversible). Returns count of deleted rows."""
+    try:
+        _, affected = dm_exec("DELETE FROM branches")
+        return jsonify({"deleted": affected})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @dm_bp.route("/api/dm/branches/export")

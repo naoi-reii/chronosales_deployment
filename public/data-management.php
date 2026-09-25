@@ -101,6 +101,31 @@ $user_role = $_SESSION['user_role'] ?? 'Admin';
         }
         .btn-danger:hover { opacity: 0.85; }
         .btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-danger-outline {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 7px 14px; border-radius: 8px;
+            border: 1.5px solid var(--danger); background: transparent;
+            font-size: 12.5px; font-weight: 600; color: var(--danger); cursor: pointer;
+            font-family: 'DM Sans', sans-serif; transition: all 0.15s; white-space: nowrap;
+        }
+        .btn-danger-outline:hover { background: var(--danger); color: #fff; }
+        /* ── Delete-all modal ─────────────────────────────────── */
+        .delete-all-warning {
+            background: #fef2f2; border: 1px solid #fca5a5;
+            border-radius: 10px; padding: 14px 16px;
+            font-size: 12.5px; color: #b91c1c; line-height: 1.6;
+            margin-bottom: 16px;
+        }
+        .delete-all-warning strong { display: block; font-size: 13.5px; margin-bottom: 4px; }
+        .delete-all-confirm-input {
+            width: 100%; padding: 9px 12px; border-radius: 8px;
+            border: 1.5px solid var(--border); font-size: 13px;
+            font-family: 'DM Mono', monospace; color: var(--ink);
+            background: var(--bg); transition: border-color 0.15s;
+            box-sizing: border-box;
+        }
+        .delete-all-confirm-input:focus { outline: none; border-color: var(--danger); }
+        .delete-all-confirm-input.matched { border-color: var(--danger); background: #fef2f2; }
 
         /* ── Table ────────────────────────────────────────────────── */
         .dm-table-wrap {
@@ -531,6 +556,9 @@ $user_role = $_SESSION['user_role'] ?? 'Admin';
                     <button class="btn-secondary" onclick="exportCSV()">
                         <i class="fa-solid fa-file-arrow-down"></i> Export
                     </button>
+                    <button class="btn-danger-outline" id="deleteAllBtn" onclick="confirmDeleteAll()" title="Delete all records in the current dataset">
+                        <i class="fa-solid fa-trash-can"></i> Delete All Records
+                    </button>
                     <button class="btn-primary" id="addNewBtn" onclick="openAddModal()">
                         <i class="fa-solid fa-plus"></i> Add New
                     </button>
@@ -601,6 +629,39 @@ $user_role = $_SESSION['user_role'] ?? 'Admin';
         <div class="modal-footer">
             <button class="btn-secondary" onclick="closeConfirmModal()">Cancel</button>
             <button class="btn-danger" id="confirmDeleteBtn"><i class="fa-solid fa-trash"></i> Delete</button>
+        </div>
+    </div>
+</div>
+
+<!-- Delete All Confirmation Modal -->
+<div class="modal-overlay" id="deleteAllModalOverlay">
+    <div class="modal" style="max-width:460px;">
+        <div class="modal-header">
+            <div class="modal-title" style="color:var(--danger);">
+                <i class="fa-solid fa-triangle-exclamation"></i>
+                <span id="deleteAllModalTitle">Delete All Records</span>
+            </div>
+            <button class="modal-close" onclick="closeDeleteAllModal()"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="modal-body" style="padding:22px 24px;">
+            <div class="delete-all-warning">
+                <strong><i class="fa-solid fa-skull-crossbones" style="margin-right:6px;"></i>This is an irreversible action!</strong>
+                All <span id="deleteAllTabLabel">records</span> in the database will be permanently deleted.
+                This <strong>cannot be undone</strong>. Make sure you have a backup before proceeding.
+            </div>
+            <div style="margin-bottom:10px;font-size:13px;color:var(--ink-2);">
+                Type <strong style="font-family:'DM Mono',monospace;color:var(--danger);" id="deleteAllConfirmWord">DELETE ALL</strong> below to confirm:
+            </div>
+            <input type="text" class="delete-all-confirm-input" id="deleteAllConfirmInput"
+                   placeholder="Type DELETE ALL to confirm"
+                   oninput="onDeleteAllInputChange()"
+                   autocomplete="off" spellcheck="false">
+        </div>
+        <div class="modal-footer">
+            <button class="btn-secondary" onclick="closeDeleteAllModal()">Cancel</button>
+            <button class="btn-danger" id="deleteAllConfirmBtn" disabled onclick="doDeleteAll()">
+                <i class="fa-solid fa-trash-can"></i> Delete All Records
+            </button>
         </div>
     </div>
 </div>
@@ -1336,6 +1397,54 @@ async function doBulkDelete() {
         await loadData();
     } catch(e) {
         showToast('Bulk delete failed: ' + e.message, 'error');
+    }
+}
+
+/* ── Delete All Records ───────────────────────────────────── */
+function confirmDeleteAll() {
+    const label = TABS[state.tab].label;
+    document.getElementById('deleteAllModalTitle').textContent = `Delete All ${label}`;
+    document.getElementById('deleteAllTabLabel').textContent = label.toLowerCase();
+    document.getElementById('deleteAllConfirmInput').value = '';
+    document.getElementById('deleteAllConfirmBtn').disabled = true;
+    document.getElementById('deleteAllModalOverlay').classList.add('open');
+    // Focus the input after animation
+    setTimeout(() => document.getElementById('deleteAllConfirmInput').focus(), 150);
+}
+
+function onDeleteAllInputChange() {
+    const val = document.getElementById('deleteAllConfirmInput').value;
+    const matched = val.trim() === 'DELETE ALL';
+    document.getElementById('deleteAllConfirmBtn').disabled = !matched;
+}
+
+function closeDeleteAllModal() {
+    document.getElementById('deleteAllModalOverlay').classList.remove('open');
+    document.getElementById('deleteAllConfirmInput').value = '';
+    document.getElementById('deleteAllConfirmBtn').disabled = true;
+}
+
+async function doDeleteAll() {
+    closeDeleteAllModal();
+    const cfg   = TABS[state.tab];
+    const label = cfg.label;
+    const btn   = document.getElementById('deleteAllBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Deleting…';
+    try {
+        const r = await fetch(`${API}?endpoint=${cfg.endpoint}/delete-all`, { method: 'DELETE' });
+        const res = await r.json();
+        if (!r.ok) throw new Error(res.error || 'Delete failed');
+        const count = res.deleted ?? 0;
+        showToast(`All ${count.toLocaleString()} ${label.toLowerCase()} deleted successfully.`, 'success');
+        state.selected.clear();
+        state.page = 1;
+        await loadData();
+    } catch(e) {
+        showToast('Delete All failed: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-trash-can"></i> Delete All Records';
     }
 }
 
