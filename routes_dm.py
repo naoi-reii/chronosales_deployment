@@ -1306,8 +1306,8 @@ def _safe_str(v, maxlen: int = None) -> str | None:
 
 def _load_lookups() -> dict:
     """
-    Fetch branch name→id, payment method name→id, discount type name→id.
-    Returns dict with keys: branches, methods, discount_types.
+    Fetch branch name→id, payment method name→id, discount type name→id, existing invoices, and customers.
+    Returns dict with keys: branches, methods, discount_types, existing_invoices, customers.
     Raises on DB error.
     """
     branches       = {r["branch_name"].strip().lower(): r["branch_id"]
@@ -1320,16 +1320,21 @@ def _load_lookups() -> dict:
         str(r["invoice_number"]).strip()
         for r in q("SELECT invoice_number FROM transactions WHERE invoice_number IS NOT NULL")
     }
+    customers      = {
+        str(r["full_name"]).strip().lower(): r["customer_id"]
+        for r in q("SELECT customer_id, full_name FROM customers WHERE full_name IS NOT NULL AND full_name != ''")
+    }
     return {
-        "branches":         branches,
-        "methods":          methods,
-        "discount_types":   discount_types,
+        "branches":          branches,
+        "methods":           methods,
+        "discount_types":    discount_types,
         "existing_invoices": existing_invoices,
+        "customers":         customers,
     }
 
 
 def _upsert_customer(cur, full_name: str, contact: str | None,
-                     address: str | None) -> int | None:
+                     address: str | None, customers_cache: dict | None = None) -> int | None:
     """
     Insert customer if not exists (match on full_name), return customer_id.
     Returns None if full_name is empty.
@@ -1337,15 +1342,27 @@ def _upsert_customer(cur, full_name: str, contact: str | None,
     if not full_name:
         return None
     name = full_name.strip()[:150]
+    name_key = name.lower()
+
+    if customers_cache is not None and name_key in customers_cache:
+        return customers_cache[name_key]
+
     cur.execute("SELECT customer_id FROM customers WHERE full_name = %s LIMIT 1", (name,))
     row = cur.fetchone()
     if row:
-        return row["customer_id"] if isinstance(row, dict) else row[0]
+        cid = row["customer_id"] if isinstance(row, dict) else row[0]
+        if customers_cache is not None:
+            customers_cache[name_key] = cid
+        return cid
+
     cur.execute(
         "INSERT INTO customers (full_name, contact, address) VALUES (%s,%s,%s)",
         (name, _safe_str(contact, 20), _safe_str(address, 200)),
     )
-    return cur.lastrowid
+    cid = cur.lastrowid
+    if customers_cache is not None:
+        customers_cache[name_key] = cid
+    return cid
 
 
 def _parse_sheet_df(wb_or_content, sheet_name: str | None, is_csv: bool) -> pd.DataFrame:
@@ -1454,6 +1471,7 @@ def _process_sheet(cur, df: pd.DataFrame, sheet_type: str,
             _safe_str(g(c_customer)),
             _safe_str(g(c_contact), 20) if c_contact else None,
             _safe_str(g(c_address), 200) if c_address else None,
+            lookups.get("customers"),
         )
 
         # ── Numeric fields ────────────────────────────────────────────────────
@@ -1702,18 +1720,9 @@ def dm_dataset_import():
     # ── Open one DB connection for the full batch ──────────────────────────────
     try:
         conn = get_db()
-        cur  = conn.cursor()
+        cur  = conn.cursor(dictionary=True)
     except Exception as e:
         return jsonify({"error": f"DB connection failed: {e}"}), 500
-
-    # Make cursor return dicts (for _upsert_customer fetchone)
-    try:
-        import pymysql
-        conn2 = get_db()
-        cur2  = conn2.cursor(pymysql.cursors.DictCursor)
-    except Exception:
-        conn2 = conn
-        cur2  = cur
 
     total_inserted, total_skipped, all_errors, by_sheet = 0, 0, [], []
 
@@ -1741,8 +1750,8 @@ def dm_dataset_import():
                 if df.empty:
                     continue
                 st = SHEET_TYPE_MAP.get(sheet_name.strip().lower(), sheet_name)
-                ins, skp, errs = _process_sheet(cur2, df, st, lookups)
-                conn2.commit()
+                ins, skp, errs = _process_sheet(cur, df, st, lookups)
+                conn.commit()
                 total_inserted += ins
                 total_skipped  += skp
                 all_errors     += errs
@@ -1758,15 +1767,15 @@ def dm_dataset_import():
                 st = SHEET_TYPE_MAP.get(first_val.lower(), first_val)
             else:
                 st = "Cash"
-            ins, skp, errs = _process_sheet(cur2, df, st, lookups)
-            conn2.commit()
+            ins, skp, errs = _process_sheet(cur, df, st, lookups)
+            conn.commit()
             total_inserted += ins
             total_skipped  += skp
             all_errors     += errs
             by_sheet.append({"name": "CSV", "inserted": ins, "skipped": skp})
 
         else:
-            cur2.close(); conn2.close()
+            cur.close(); conn.close()
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
             return jsonify({"error": "Only .xlsx or .csv files are accepted"}), 400
@@ -1782,9 +1791,9 @@ def dm_dataset_import():
             except Exception:
                 pass
         try:
-            conn2.commit()
-            cur2.close()
-            conn2.close()
+            conn.commit()
+            cur.close()
+            conn.close()
         except Exception:
             pass
 
