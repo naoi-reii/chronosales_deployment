@@ -1321,7 +1321,7 @@ def _load_lookups() -> dict:
         for r in q("SELECT invoice_number FROM transactions WHERE invoice_number IS NOT NULL")
     }
     customers      = {
-        str(r["full_name"]).strip().lower(): r["customer_id"]
+        str(r["full_name"]).strip()[:150].lower(): r["customer_id"]
         for r in q("SELECT customer_id, full_name FROM customers WHERE full_name IS NOT NULL AND full_name != ''")
     }
     return {
@@ -1347,22 +1347,98 @@ def _upsert_customer(cur, full_name: str, contact: str | None,
     if customers_cache is not None and name_key in customers_cache:
         return customers_cache[name_key]
 
-    cur.execute("SELECT customer_id FROM customers WHERE full_name = %s LIMIT 1", (name,))
-    row = cur.fetchone()
-    if row:
-        cid = row["customer_id"] if isinstance(row, dict) else row[0]
-        if customers_cache is not None:
-            customers_cache[name_key] = cid
-        return cid
+    cid = None
+    try:
+        cur.execute(
+            "INSERT INTO customers (full_name, contact, address) VALUES (%s,%s,%s)",
+            (name, _safe_str(contact, 20), _safe_str(address, 200)),
+        )
+        cid = cur.lastrowid
+    except Exception:
+        pass
 
-    cur.execute(
-        "INSERT INTO customers (full_name, contact, address) VALUES (%s,%s,%s)",
-        (name, _safe_str(contact, 20), _safe_str(address, 200)),
-    )
-    cid = cur.lastrowid
-    if customers_cache is not None:
+    if not cid:
+        try:
+            cur.execute("SELECT customer_id FROM customers WHERE full_name = %s LIMIT 1", (name,))
+            row = cur.fetchone()
+            if row:
+                cid = row["customer_id"] if isinstance(row, dict) else row[0]
+        except Exception:
+            pass
+
+    if customers_cache is not None and cid:
         customers_cache[name_key] = cid
     return cid
+
+
+def _bulk_upsert_customers(cur, conn, dfs: list[pd.DataFrame], customers_cache: dict):
+    """
+    Scans all DataFrames for customer names, bulk inserts any missing customers into DB in batch,
+    and populates customers_cache in memory.
+    """
+    new_customers = {}  # name_key -> (name, contact, address)
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        c_customer = _col(df, "Customer", "customer_name")
+        if not c_customer:
+            continue
+        c_contact = _col(df, "Contact")
+        c_address = _col(df, "Address")
+
+        records = df.to_dict("records")
+        for row in records:
+            raw_name = row.get(c_customer)
+            if raw_name is None or pd.isna(raw_name):
+                continue
+            name = str(raw_name).strip()[:150]
+            if not name:
+                continue
+            name_key = name.lower()
+            if name_key in customers_cache or name_key in new_customers:
+                continue
+            contact = _safe_str(row.get(c_contact), 20) if c_contact else None
+            address = _safe_str(row.get(c_address), 200) if c_address else None
+            new_customers[name_key] = (name, contact, address)
+
+    if not new_customers:
+        return
+
+    insert_tuples = list(new_customers.values())
+    chunk_size = 500
+    sql_cust = "INSERT INTO customers (full_name, contact, address) VALUES (%s, %s, %s)"
+
+    for i in range(0, len(insert_tuples), chunk_size):
+        chunk = insert_tuples[i:i + chunk_size]
+        try:
+            cur.executemany(sql_cust, chunk)
+            conn.commit()
+        except Exception:
+            for c_name, c_cnt, c_addr in chunk:
+                try:
+                    cur.execute(sql_cust, (c_name, c_cnt, c_addr))
+                except Exception:
+                    pass
+            conn.commit()
+
+    # Re-fetch customer IDs for inserted customers to update cache
+    new_names = [c[0] for c in insert_tuples]
+    for i in range(0, len(new_names), chunk_size):
+        name_chunk = new_names[i:i + chunk_size]
+        format_strings = ','.join(['%s'] * len(name_chunk))
+        try:
+            cur.execute(
+                f"SELECT customer_id, full_name FROM customers WHERE full_name IN ({format_strings})",
+                tuple(name_chunk)
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                c_name = r["full_name"] if isinstance(r, dict) else r[1]
+                c_id   = r["customer_id"] if isinstance(r, dict) else r[0]
+                if c_name:
+                    customers_cache[str(c_name).strip()[:150].lower()] = c_id
+        except Exception:
+            pass
 
 
 def _parse_sheet_df(wb_or_content, sheet_name: str | None, is_csv: bool) -> pd.DataFrame:
@@ -1626,7 +1702,7 @@ def _process_sheet(conn, cur, df: pd.DataFrame, sheet_type: str,
         batch_txns.append(txn_tuple)
         batch_payments.append({"st": st, "data": p_data})
 
-        if len(batch_txns) >= 100:
+        if len(batch_txns) >= 250:
             flush_batch()
 
     flush_batch()
@@ -1769,18 +1845,25 @@ def dm_dataset_import():
 
         if fname.endswith(".xlsx"):
             wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+            sheet_dfs = []
             for sheet_name in wb.sheetnames:
                 df = _parse_sheet_df(wb, sheet_name, is_csv=False)
                 if df.empty:
                     continue
                 st = SHEET_TYPE_MAP.get(sheet_name.strip().lower(), sheet_name)
+                sheet_dfs.append((sheet_name, df, st))
+            wb.close()
+
+            # Pre-load/bulk create all unique customers across all sheets
+            _bulk_upsert_customers(cur, conn, [s[1] for s in sheet_dfs], lookups["customers"])
+
+            for sheet_name, df, st in sheet_dfs:
                 ins, skp, errs = _process_sheet(conn, cur, df, st, lookups)
                 conn.commit()
                 total_inserted += ins
                 total_skipped  += skp
                 all_errors     += errs
                 by_sheet.append({"name": sheet_name, "inserted": ins, "skipped": skp})
-            wb.close()
 
         elif fname.endswith(".csv"):
             df = pd.read_csv(tmp_path, dtype=str).fillna("")
@@ -1791,6 +1874,10 @@ def dm_dataset_import():
                 st = SHEET_TYPE_MAP.get(first_val.lower(), first_val)
             else:
                 st = "Cash"
+
+            # Pre-load/bulk create customers for CSV
+            _bulk_upsert_customers(cur, conn, [df], lookups["customers"])
+
             ins, skp, errs = _process_sheet(conn, cur, df, st, lookups)
             conn.commit()
             total_inserted += ins
