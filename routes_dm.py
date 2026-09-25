@@ -1607,6 +1607,9 @@ def dm_dataset_preview():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded. Send multipart/form-data with key 'file'."}), 400
 
+    import tempfile
+    import os
+    
     f = request.files["file"]
     fname = f.filename.lower()
 
@@ -1615,11 +1618,14 @@ def dm_dataset_preview():
     if size > 20 * 1024 * 1024:
         return jsonify({"error": "File exceeds 20 MB limit"}), 400
 
-    raw = f.read()
-
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+            f.save(tmp.name)
+            tmp_path = tmp.name
+
         if fname.endswith(".xlsx"):
-            wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
             sheets_out, total_rows = [], 0
             for sheet_name in wb.sheetnames:
                 df = _parse_sheet_df(wb, sheet_name, is_csv=False)
@@ -1636,11 +1642,7 @@ def dm_dataset_preview():
             return jsonify({"sheets": sheets_out, "total_rows": total_rows, "file_type": "xlsx"})
 
         elif fname.endswith(".csv"):
-            try:
-                content = raw.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                content = raw.decode("latin-1")
-            df = pd.read_csv(io.StringIO(content), dtype=str).fillna("")
+            df = pd.read_csv(tmp_path, dtype=str).fillna("")
             return jsonify({
                 "sheets": [{
                     "name":       "CSV",
@@ -1657,6 +1659,9 @@ def dm_dataset_preview():
 
     except Exception as e:
         return jsonify({"error": f"Could not read file: {e}"}), 400
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ── route: import ─────────────────────────────────────────────────────────────
@@ -1677,14 +1682,15 @@ def dm_dataset_import():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
+    import tempfile
+    import os
+
     f = request.files["file"]
     fname = f.filename.lower()
 
     f.seek(0, 2); size = f.tell(); f.seek(0)
     if size > 20 * 1024 * 1024:
         return jsonify({"error": "File exceeds 20 MB limit"}), 400
-
-    raw = f.read()
 
     # ── Load lookups ──────────────────────────────────────────────────────────
     try:
@@ -1720,9 +1726,14 @@ def dm_dataset_import():
         "multi":  "Multi",
     }
 
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+            f.save(tmp.name)
+            tmp_path = tmp.name
+
         if fname.endswith(".xlsx"):
-            wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
             for sheet_name in wb.sheetnames:
                 df = _parse_sheet_df(wb, sheet_name, is_csv=False)
                 if df.empty:
@@ -1737,11 +1748,7 @@ def dm_dataset_import():
             wb.close()
 
         elif fname.endswith(".csv"):
-            try:
-                content = raw.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                content = raw.decode("latin-1")
-            df = pd.read_csv(io.StringIO(content), dtype=str).fillna("")
+            df = pd.read_csv(tmp_path, dtype=str).fillna("")
             # Infer sheet type from the Overall Payment Type column
             pay_col = _col(df, "Overall Payment Type", "payment_type")
             if pay_col and not df.empty:
@@ -1758,6 +1765,8 @@ def dm_dataset_import():
 
         else:
             cur2.close(); conn2.close()
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
             return jsonify({"error": "Only .xlsx or .csv files are accepted"}), 400
 
     except Exception as e:
@@ -1765,6 +1774,11 @@ def dm_dataset_import():
         traceback.print_exc()
         return jsonify({"error": f"Import failed: {e}"}), 500
     finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
         try:
             conn2.commit()
             cur2.close()
@@ -1790,16 +1804,29 @@ def ml_upload_csv():
     f = request.files["file"]
     if not f.filename.lower().endswith(".csv"):
         return jsonify({"error": "Only CSV files are accepted"}), 400
+    import tempfile
+    import os
+
     try:
-        content = f.read().decode("utf-8-sig")
-        df      = pd.read_csv(io.StringIO(content))
+        tmp_path = None
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+            f.save(tmp.name)
+            tmp_path = tmp.name
+        
+        df = pd.read_csv(tmp_path)
         preview = df.head(10).fillna("").astype(str).to_dict(orient="records")
+        
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            
         return jsonify({
             "columns":    list(df.columns),
             "total_rows": len(df),
             "preview":    preview,
         })
     except Exception as e:
+        if 'tmp_path' in locals() and tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return jsonify({"error": str(e)}), 400
 
 
