@@ -271,6 +271,11 @@ def _train_lstm(job_id, X_raw, y_raw, feature_cols, target_col,
         rmse = round(random.uniform(120, 300), 2)
         mape = round(random.uniform(3, 12), 2)
 
+    # Cap metrics to prevent database overflow
+    mae  = min(mae, 99999999.99)
+    rmse = min(rmse, 99999999.99)
+    mape = min(mape, 9999.99)
+
     print(f"\n  MAE={mae:.2f}  RMSE={rmse:.2f}  MAPE={mape:.2f}%\n{'='*60}\n", flush=True)
 
     return {
