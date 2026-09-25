@@ -1,5 +1,7 @@
 <?php
 
+set_time_limit(300);
+
 session_start();
 if (!isset($_SESSION['user_id'])) {
     http_response_code(401);
@@ -143,9 +145,9 @@ if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'])) {
             ];
             $mime = $mimeMap[$ext] ?? ($_FILES['file']['type'] ?: 'application/octet-stream');
 
-            // Dataset imports can be large — allow up to 120 s
+            // Dataset imports can be large — allow up to 300 s
             $isDataset = in_array($endpoint, ['dm/dataset/preview', 'dm/dataset/import']);
-            $timeout   = $isDataset ? 120 : 15;
+            $timeout   = $isDataset ? 300 : 30;
 
             $ch = curl_init($flaskUrl);
             curl_setopt_array($ch, [
@@ -162,8 +164,17 @@ if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'])) {
             ]);
             $body   = curl_exec($ch);
             $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $err    = curl_error($ch);
             curl_close($ch);
-            http_response_code($status);
+
+            if ($body === false || $body === '') {
+                http_response_code(504);
+                header('Content-Type: application/json');
+                echo json_encode(['error' => 'Backend timeout or empty response: ' . ($err ?: 'Gateway Timeout')]);
+                exit;
+            }
+
+            http_response_code($status ?: 200);
             header('Content-Type: application/json');
             echo $body;
             exit;

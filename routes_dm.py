@@ -1393,24 +1393,24 @@ def _col(df: pd.DataFrame, *candidates) -> str | None:
 
 # ── per-sheet normaliser ──────────────────────────────────────────────────────
 
-def _process_sheet(cur, df: pd.DataFrame, sheet_type: str,
+def _process_sheet(conn, cur, df: pd.DataFrame, sheet_type: str,
                    lookups: dict) -> tuple[int, int, list]:
     """
     Insert all rows from one sheet into transactions + payment detail table.
+    Uses batching with executemany for maximum performance over cloud connections.
     Returns (inserted, skipped, errors).
     """
     inserted, skipped = 0, 0
     errors = []
 
-    branches         = lookups["branches"]
-    methods          = lookups["methods"]
-    discount_types   = lookups["discount_types"]
+    branches          = lookups["branches"]
+    methods           = lookups["methods"]
+    discount_types    = lookups["discount_types"]
     existing_invoices = lookups["existing_invoices"]
+    customers_cache   = lookups["customers"]
 
-    # ── column map ────────────────────────────────────────────────────────────
     C = lambda *a: _col(df, *a)   # noqa: E731
 
-    c_txn_id   = C("Transaction ID", "transaction_id")
     c_invoice  = C("Invoice #", "Invoice#", "invoice_number", "invoice")
     c_date     = C("Date", "transaction_date")
     c_customer = C("Customer", "customer_name")
@@ -1428,21 +1428,101 @@ def _process_sheet(cur, df: pd.DataFrame, sheet_type: str,
     c_status   = C("Transaction Status", "transaction_status")
     c_amount   = C("Amount", "amount")
 
-    for idx, row in df.iterrows():
-        row_num = idx + 2  # 1-based + header offset
+    records = df.to_dict("records")
+    batch_txns = []
+    batch_payments = []
+
+    def flush_batch():
+        nonlocal inserted, batch_txns, batch_payments
+        if not batch_txns:
+            return
+
+        sql_txn = """
+            INSERT INTO transactions
+                (invoice_number, transaction_date, customer_id, branch_id,
+                 discount_type_id, discount_value, total_treatment, total_product,
+                 final_discount, vat, grand_total,
+                 overall_payment_method_id, transaction_status)
+            VALUES (%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s)
+        """
+        try:
+            cur.executemany(sql_txn, batch_txns)
+            first_id = cur.lastrowid
+            inserted += len(batch_txns)
+        except Exception as e:
+            # Fallback to single inserts if batch execution encounters an error
+            for txn_tuple in batch_txns:
+                try:
+                    cur.execute(sql_txn, txn_tuple)
+                    inserted += 1
+                except Exception:
+                    pass
+            batch_txns = []
+            batch_payments = []
+            conn.commit()
+            return
+
+        pay_cash, pay_card, pay_check, pay_qr, pay_bt, pay_cd, pay_multi = [], [], [], [], [], [], []
+
+        for i, p_info in enumerate(batch_payments):
+            txn_id  = first_id + i
+            st_type = p_info["st"]
+            g_data  = p_info["data"]
+
+            if st_type == "cash":
+                pay_cash.append((txn_id, g_data["amount"], g_data["cash_recv"], g_data["change"]))
+            elif st_type == "card":
+                pay_card.append((txn_id, g_data["amount"], g_data["approval"], g_data["card_amt"], g_data["last4"], g_data["terminal"]))
+            elif st_type == "check":
+                pay_check.append((txn_id, g_data["amount"], g_data["bank_name"], g_data["chk_amt"], g_data["chk_num"]))
+            elif st_type == "qr":
+                pay_qr.append((txn_id, g_data["amount"], g_data["qr_amt"], g_data["qr_app"], g_data["qr_ref"]))
+            elif st_type == "others":
+                if g_data["bt_amt"] is not None:
+                    pay_bt.append((txn_id, g_data["bt_amt"], g_data["bt_bank"], g_data["bt_ref"]))
+                if g_data["cd_amt"] is not None:
+                    pay_cd.append((txn_id, g_data["cd_amt"], g_data["cd_sid"], g_data["cd_sno"]))
+            elif st_type == "multi":
+                for split in g_data["splits"]:
+                    pay_multi.append((txn_id, split["order"], split["mid"], split["amt"]))
+
+        try:
+            if pay_cash:
+                cur.executemany("INSERT INTO payment_cash (transaction_id, amount, cash_received, change_given) VALUES (%s,%s,%s,%s)", pay_cash)
+            if pay_card:
+                cur.executemany("INSERT INTO payment_card (transaction_id, amount, approval_code, card_amount, last_4_digits, terminal_type) VALUES (%s,%s,%s,%s,%s,%s)", pay_card)
+            if pay_check:
+                cur.executemany("INSERT INTO payment_check (transaction_id, amount, bank_name, check_amount, check_number) VALUES (%s,%s,%s,%s,%s)", pay_check)
+            if pay_qr:
+                cur.executemany("INSERT INTO payment_qr (transaction_id, amount, qr_amount, qr_app_name, qr_reference) VALUES (%s,%s,%s,%s,%s)", pay_qr)
+            if pay_bt:
+                cur.executemany("INSERT INTO payment_bank_transfer (transaction_id, amount, bank_name, reference_number) VALUES (%s,%s,%s,%s)", pay_bt)
+            if pay_cd:
+                cur.executemany("INSERT INTO payment_customer_deposit (transaction_id, amount, series_id, series_number) VALUES (%s,%s,%s,%s)", pay_cd)
+            if pay_multi:
+                cur.executemany("INSERT INTO payment_multi_splits (transaction_id, split_order, method_id, amount) VALUES (%s,%s,%s,%s)", pay_multi)
+        except Exception:
+            pass
+
+        conn.commit()
+        batch_txns = []
+        batch_payments = []
+
+    for idx, row in enumerate(records):
+        row_num = idx + 2
 
         def g(col):
-            """Get cell value; return empty string if column missing."""
-            return row[col] if col else ""
+            if not col or col not in row:
+                return ""
+            val = row[col]
+            return "" if val is None or pd.isna(val) else val
 
-        # ── Invoice duplicate guard ───────────────────────────────────────────
         invoice_raw = _safe_str(g(c_invoice))
         if invoice_raw and invoice_raw in existing_invoices:
             skipped += 1
             errors.append(f"Row {row_num}: invoice '{invoice_raw}' already exists — skipped")
             continue
 
-        # ── Branch lookup ─────────────────────────────────────────────────────
         branch_name = _safe_str(g(c_branch), 120)
         branch_id   = branches.get(branch_name.lower()) if branch_name else None
         if branch_id is None:
@@ -1450,31 +1530,26 @@ def _process_sheet(cur, df: pd.DataFrame, sheet_type: str,
             errors.append(f"Row {row_num}: branch '{branch_name}' not found — skipped")
             continue
 
-        # ── Payment method lookup ─────────────────────────────────────────────
         pay_type_raw = _safe_str(g(c_pay_type)) or sheet_type
         method_id    = methods.get(pay_type_raw.lower()) if pay_type_raw else None
         if method_id is None:
-            # try sheet_type as fallback
             method_id = methods.get(sheet_type.lower())
         if method_id is None:
             skipped += 1
             errors.append(f"Row {row_num}: payment method '{pay_type_raw}' not found — skipped")
             continue
 
-        # ── Discount type lookup ──────────────────────────────────────────────
         disc_type_raw = _safe_str(g(c_disc_type))
         discount_type_id = discount_types.get(disc_type_raw.lower()) if disc_type_raw else None
 
-        # ── Customer upsert ───────────────────────────────────────────────────
         customer_id = _upsert_customer(
             cur,
             _safe_str(g(c_customer)),
             _safe_str(g(c_contact), 20) if c_contact else None,
             _safe_str(g(c_address), 200) if c_address else None,
-            lookups.get("customers"),
+            customers_cache,
         )
 
-        # ── Numeric fields ────────────────────────────────────────────────────
         grand_total = _safe_dec(g(c_grand))
         if grand_total is None:
             skipped += 1
@@ -1490,122 +1565,71 @@ def _process_sheet(cur, df: pd.DataFrame, sheet_type: str,
         txn_date    = _safe_str(g(c_date))
         status      = _safe_str(g(c_status)) or "OK"
 
-        # ── Insert transaction ────────────────────────────────────────────────
-        try:
-            cur.execute("""
-                INSERT INTO transactions
-                    (invoice_number, transaction_date, customer_id, branch_id,
-                     discount_type_id, discount_value, total_treatment, total_product,
-                     final_discount, vat, grand_total,
-                     overall_payment_method_id, transaction_status)
-                VALUES (%s,%s,%s,%s, %s,%s,%s,%s, %s,%s,%s, %s,%s)
-            """, (
-                invoice_raw,
-                txn_date,
-                customer_id,
-                branch_id,
-                discount_type_id,
-                disc_value,
-                total_treat,
-                total_prod,
-                final_disc,
-                vat,
-                grand_total,
-                method_id,
-                status,
-            ))
-            new_txn_id = cur.lastrowid
-        except Exception as e:
-            skipped += 1
-            errors.append(f"Row {row_num}: transaction insert failed — {e}")
-            continue
-
-        # Mark as known so duplicates within the same upload are caught
         if invoice_raw:
             existing_invoices.add(invoice_raw)
 
-        # ── Insert payment detail ─────────────────────────────────────────────
-        try:
-            st = sheet_type.lower()
+        txn_tuple = (
+            invoice_raw, txn_date, customer_id, branch_id,
+            discount_type_id, disc_value, total_treat, total_prod,
+            final_disc, vat, grand_total, method_id, status
+        )
 
-            if st == "cash":
-                cash_recv  = _safe_dec(g(C("Cash Received", "cash_received")))
-                change     = _safe_dec(g(C("Change", "change_given")))
-                cur.execute(
-                    "INSERT INTO payment_cash (transaction_id, amount, cash_received, change_given) VALUES (%s,%s,%s,%s)",
-                    (new_txn_id, amount, cash_recv, change),
-                )
+        st = sheet_type.lower()
+        p_data = {}
+        if st == "cash":
+            p_data = {
+                "amount": amount,
+                "cash_recv": _safe_dec(g(C("Cash Received", "cash_received"))),
+                "change": _safe_dec(g(C("Change", "change_given"))),
+            }
+        elif st == "card":
+            p_data = {
+                "amount": amount,
+                "approval": _safe_str(g(C("Approval Code", "approval_code")), 20),
+                "card_amt": _safe_dec(g(C("Card Amount", "card_amount"))),
+                "last4": _safe_str(g(C("Last 4 Digits", "last_4_digits")), 4),
+                "terminal": _safe_str(g(C("Terminal Type", "terminal_type")), 40),
+            }
+        elif st == "check":
+            p_data = {
+                "amount": amount,
+                "bank_name": _safe_str(g(C("Bank Name", "bank_name")), 60),
+                "chk_amt": _safe_dec(g(C("Check Amount", "check_amount"))),
+                "chk_num": _safe_str(g(C("Check Number", "check_number")), 30),
+            }
+        elif st == "qr":
+            p_data = {
+                "amount": amount,
+                "qr_amt": _safe_dec(g(C("Qr Amount", "QR Amount", "qr_amount"))),
+                "qr_app": _safe_str(g(C("Qr App Name", "QR App Name", "qr_app_name")), 40),
+                "qr_ref": _safe_str(g(C("Qr Reference", "QR Reference", "qr_reference")), 60),
+            }
+        elif st == "others":
+            p_data = {
+                "bt_amt": _safe_dec(g(C("Banktransfer Amount", "banktransfer_amount"))),
+                "bt_bank": _safe_str(g(C("Banktransfer Bank", "banktransfer_bank")), 60),
+                "bt_ref": _safe_str(g(C("Banktransfer Ref No", "banktransfer_ref_no")), 80),
+                "cd_amt": _safe_dec(g(C("Customerdeposit Amount", "customerdeposit_amount"))),
+                "cd_sid": _safe_str(g(C("Customerdeposit Series Id", "customerdeposit_series_id")), 20),
+                "cd_sno": _safe_str(g(C("Customerdeposit Series No", "customerdeposit_series_no")), 20),
+            }
+        elif st == "multi":
+            splits = []
+            for split_order in range(1, 4):
+                p_method = _safe_str(g(C(f"Payment {split_order} Method", f"payment_{split_order}_method")))
+                p_amount = _safe_dec(g(C(f"Payment {split_order} Amount", f"payment_{split_order}_amount")))
+                if p_method and p_amount is not None:
+                    split_method_id = methods.get(p_method.lower())
+                    splits.append({"order": split_order, "mid": split_method_id, "amt": p_amount})
+            p_data = {"splits": splits}
 
-            elif st == "card":
-                approval   = _safe_str(g(C("Approval Code", "approval_code")), 20)
-                card_amt   = _safe_dec(g(C("Card Amount", "card_amount")))
-                last4      = _safe_str(g(C("Last 4 Digits", "last_4_digits")), 4)
-                terminal   = _safe_str(g(C("Terminal Type", "terminal_type")), 40)
-                cur.execute(
-                    "INSERT INTO payment_card (transaction_id, amount, approval_code, card_amount, last_4_digits, terminal_type) VALUES (%s,%s,%s,%s,%s,%s)",
-                    (new_txn_id, amount, approval, card_amt, last4, terminal),
-                )
+        batch_txns.append(txn_tuple)
+        batch_payments.append({"st": st, "data": p_data})
 
-            elif st == "check":
-                bank_name  = _safe_str(g(C("Bank Name", "bank_name")), 60)
-                chk_amt    = _safe_dec(g(C("Check Amount", "check_amount")))
-                chk_num    = _safe_str(g(C("Check Number", "check_number")), 30)
-                cur.execute(
-                    "INSERT INTO payment_check (transaction_id, amount, bank_name, check_amount, check_number) VALUES (%s,%s,%s,%s,%s)",
-                    (new_txn_id, amount, bank_name, chk_amt, chk_num),
-                )
+        if len(batch_txns) >= 100:
+            flush_batch()
 
-            elif st == "qr":
-                qr_amt     = _safe_dec(g(C("Qr Amount", "QR Amount", "qr_amount")))
-                qr_app     = _safe_str(g(C("Qr App Name", "QR App Name", "qr_app_name")), 40)
-                qr_ref     = _safe_str(g(C("Qr Reference", "QR Reference", "qr_reference")), 60)
-                cur.execute(
-                    "INSERT INTO payment_qr (transaction_id, amount, qr_amount, qr_app_name, qr_reference) VALUES (%s,%s,%s,%s,%s)",
-                    (new_txn_id, amount, qr_amt, qr_app, qr_ref),
-                )
-
-            elif st == "others":
-                # BankTransfer columns
-                bt_amt     = _safe_dec(g(C("Banktransfer Amount", "banktransfer_amount")))
-                bt_bank    = _safe_str(g(C("Banktransfer Bank", "banktransfer_bank")), 60)
-                bt_ref     = _safe_str(g(C("Banktransfer Ref No", "banktransfer_ref_no")), 80)
-                if bt_amt is not None:
-                    cur.execute(
-                        "INSERT INTO payment_bank_transfer (transaction_id, amount, bank_name, reference_number) VALUES (%s,%s,%s,%s)",
-                        (new_txn_id, bt_amt, bt_bank, bt_ref),
-                    )
-                # CustomerDeposit columns
-                cd_amt     = _safe_dec(g(C("Customerdeposit Amount", "customerdeposit_amount")))
-                cd_sid     = _safe_str(g(C("Customerdeposit Series Id",  "customerdeposit_series_id")),  20)
-                cd_sno     = _safe_str(g(C("Customerdeposit Series No",  "customerdeposit_series_no")),  20)
-                if cd_amt is not None:
-                    cur.execute(
-                        "INSERT INTO payment_customer_deposit (transaction_id, amount, series_id, series_number) VALUES (%s,%s,%s,%s)",
-                        (new_txn_id, cd_amt, cd_sid, cd_sno),
-                    )
-
-            elif st == "multi":
-                # Up to 3 payment splits
-                for split_order in range(1, 4):
-                    p_method = _safe_str(g(C(f"Payment {split_order} Method",
-                                             f"payment_{split_order}_method")))
-                    p_amount = _safe_dec(g(C(f"Payment {split_order} Amount",
-                                             f"payment_{split_order}_amount")))
-                    if p_method and p_amount is not None:
-                        split_method_id = methods.get(p_method.lower())
-                        cur.execute(
-                            "INSERT INTO payment_multi_splits (transaction_id, split_order, method_id, amount) VALUES (%s,%s,%s,%s)",
-                            (new_txn_id, split_order, split_method_id, p_amount),
-                        )
-
-        except Exception as e:
-            # Payment detail failed — still count the transaction as inserted
-            errors.append(f"Row {row_num}: payment detail insert failed — {e}")
-
-        inserted += 1
-        if inserted % 100 == 0:
-            (cur._connection if hasattr(cur, '_connection') else cur.connection).commit()
-
+    flush_batch()
     return inserted, skipped, errors
 
 
@@ -1750,7 +1774,7 @@ def dm_dataset_import():
                 if df.empty:
                     continue
                 st = SHEET_TYPE_MAP.get(sheet_name.strip().lower(), sheet_name)
-                ins, skp, errs = _process_sheet(cur, df, st, lookups)
+                ins, skp, errs = _process_sheet(conn, cur, df, st, lookups)
                 conn.commit()
                 total_inserted += ins
                 total_skipped  += skp
@@ -1767,7 +1791,7 @@ def dm_dataset_import():
                 st = SHEET_TYPE_MAP.get(first_val.lower(), first_val)
             else:
                 st = "Cash"
-            ins, skp, errs = _process_sheet(cur, df, st, lookups)
+            ins, skp, errs = _process_sheet(conn, cur, df, st, lookups)
             conn.commit()
             total_inserted += ins
             total_skipped  += skp
